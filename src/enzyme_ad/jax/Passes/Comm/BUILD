@@ -36,6 +36,7 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = [
         ":PassesIncGen",
+        "//src/enzyme_ad/jax:EnzymeXLADialect",
         "//src/enzyme_ad/jax/Dialect/Comm:CommDialect",
         "//src/enzyme_ad/jax/Runtime:jit",
         "@llvm-project//mlir:FuncTransforms",
