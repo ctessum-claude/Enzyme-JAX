@@ -4,7 +4,8 @@
 // path (scatter drops it). The single-point scatter must not become a
 // plain dynamic_update_slice — DUS clamps the index back in bounds — so
 // the mask is resolved first: slice the original value and write it back
-// when masked off.
+// when masked off. The live index is still arbitrary, so the scatter stays a
+// scatter (a DUS would clamp an out-of-range live index too).
 func.func @main(%buf: tensor<50xf64>, %i: tensor<i64>, %p: tensor<i1>, %v: tensor<f64>) -> tensor<50xf64> {
   %cm1 = stablehlo.constant dense<-1> : tensor<1xi64>
   %ir = stablehlo.reshape %i : (tensor<i64>) -> tensor<1xi64>
@@ -18,9 +19,9 @@ func.func @main(%buf: tensor<50xf64>, %i: tensor<i64>, %p: tensor<i1>, %v: tenso
 }
 
 // CHECK-LABEL: func.func @main(
+// CHECK:         %[[IDX:.+]] = stablehlo.reshape %arg1 : (tensor<i64>) -> tensor<1xi64>
 // CHECK:         %[[ORIG:.+]] = stablehlo.dynamic_slice %arg0, %arg1, sizes = [1]
 // CHECK:         %[[ORIGS:.+]] = stablehlo.reshape %[[ORIG]] : (tensor<1xf64>) -> tensor<f64>
 // CHECK:         %[[UPD:.+]] = stablehlo.select %arg2, %arg3, %[[ORIGS]]
-// CHECK:         %[[UPD1:.+]] = stablehlo.reshape %[[UPD]] : (tensor<f64>) -> tensor<1xf64>
-// CHECK:         %[[RES:.+]] = stablehlo.dynamic_update_slice %arg0, %[[UPD1]], %arg1
+// CHECK:         %[[RES:.+]] = "stablehlo.scatter"(%arg0, %[[IDX]], %[[UPD]])
 // CHECK:         return %[[RES]]

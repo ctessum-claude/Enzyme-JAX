@@ -5,7 +5,9 @@
 // the index provably lands in bounds.
 
 // A dead-lane scatter sends its index out of bounds through a negative
-// select arm: stays a scatter.
+// select arm. The mask is resolved into the update (write the original value
+// back when dead) and the scatter stays a scatter at the live index, which
+// is still unproven.
 
 module {
   func.func @masked_single_scatter(%buf: tensor<12xf64>, %idx: tensor<i64>, %pred: tensor<i1>, %val: tensor<f64>) -> tensor<12xf64> {
@@ -21,14 +23,15 @@ module {
 }
 
 // CHECK:  func.func @masked_single_scatter(%[[v1:.+]]: tensor<12xf64>, %[[v2:.+]]: tensor<i64>, %[[v3:.+]]: tensor<i1>, %[[v4:.+]]: tensor<f64>) -> tensor<12xf64> {
-// CHECK-NEXT:  %[[v5:.+]] = stablehlo.constant dense<-1> : tensor<i64>
-// CHECK-NEXT:  %[[v6:.+]] = stablehlo.select %[[v3]], %[[v2]], %[[v5]] : tensor<i1>, tensor<i64>
-// CHECK-NEXT:  %[[v7:.+]] = stablehlo.reshape %[[v6]] : (tensor<i64>) -> tensor<1xi64>
-// CHECK-NEXT:  %[[v8:.+]] = "stablehlo.scatter"(%[[v1]], %[[v7]], %[[v4]]) <{indices_are_sorted = false, scatter_dimension_numbers = #stablehlo.scatter<inserted_window_dims = [0], scatter_dims_to_operand_dims = [0]>, unique_indices = true}> ({
-// CHECK-NEXT:  ^bb0(%[[v9:.+]]: tensor<f64>, %[[v10:.+]]: tensor<f64>):
-// CHECK-NEXT:    stablehlo.return %[[v10]] : tensor<f64>
+// CHECK-NEXT:  %[[v5:.+]] = stablehlo.dynamic_slice %[[v1]], %[[v2]], sizes = [1] : (tensor<12xf64>, tensor<i64>) -> tensor<1xf64>
+// CHECK-NEXT:  %[[v6:.+]] = stablehlo.reshape %[[v5]] : (tensor<1xf64>) -> tensor<f64>
+// CHECK-NEXT:  %[[v7:.+]] = stablehlo.select %[[v3]], %[[v4]], %[[v6]] : tensor<i1>, tensor<f64>
+// CHECK-NEXT:  %[[v8:.+]] = stablehlo.reshape %[[v2]] : (tensor<i64>) -> tensor<1xi64>
+// CHECK-NEXT:  %[[v9:.+]] = "stablehlo.scatter"(%[[v1]], %[[v8]], %[[v7]]) <{indices_are_sorted = false, scatter_dimension_numbers = #stablehlo.scatter<inserted_window_dims = [0], scatter_dims_to_operand_dims = [0]>, unique_indices = true}> ({
+// CHECK-NEXT:  ^bb0(%[[v10:.+]]: tensor<f64>, %[[v11:.+]]: tensor<f64>):
+// CHECK-NEXT:    stablehlo.return %[[v11]] : tensor<f64>
 // CHECK-NEXT:  }) : (tensor<12xf64>, tensor<1xi64>, tensor<f64>) -> tensor<12xf64>
-// CHECK-NEXT:  return %[[v8]] : tensor<12xf64>
+// CHECK-NEXT:  return %[[v9]] : tensor<12xf64>
 // CHECK-NEXT:  }
 
 // -----
