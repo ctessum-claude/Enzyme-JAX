@@ -5388,29 +5388,88 @@ struct AffineToStableHLORaisingPass
   // raising then iterates, leaving the constant-extent dimensions to raise as
   // axes. The tag rides onto the stablehlo.while so downstream passes know
   // the iterations commute.
-  // The bound the relation `v REL C` puts on v when it holds, or when its
-  // negation holds.
-  static std::optional<int64_t> relationBound(arith::CmpIOp cmp, Value v,
-                                              bool holds) {
-    APInt cst;
-    bool onLhs =
-        cmp.getLhs() == v && matchPattern(cmp.getRhs(), m_ConstantInt(&cst));
-    if (!onLhs &&
-        !(cmp.getRhs() == v && matchPattern(cmp.getLhs(), m_ConstantInt(&cst))))
+  // Two loads of the same member (this->dofs1D read once for the verify and
+  // again for the launch) are the same scalar: mfem does not write the
+  // integrator's dims between its own verify and its own launch.
+  static bool sameMemberLoad(Value a, Value b) {
+    if (a == b)
+      return true;
+    auto la = a.getDefiningOp<affine::AffineLoadOp>();
+    auto lb = b.getDefiningOp<affine::AffineLoadOp>();
+    if (!la || !lb || !la.getMapOperands().empty() ||
+        !lb.getMapOperands().empty() || la.getMap() != lb.getMap())
+      return false;
+    Value ma = la.getMemRef(), mb = lb.getMemRef();
+    if (ma == mb)
+      return true;
+    auto pa = ma.getDefiningOp<enzymexla::Pointer2MemrefOp>();
+    auto pb = mb.getDefiningOp<enzymexla::Pointer2MemrefOp>();
+    return pa && pb && pa->getOperand(0) == pb->getOperand(0);
+  }
+
+  // Whether `ifOp` is a verify dominating `anchor`: exactly one arm aborts,
+  // so on every path reaching the anchor the condition holds (true) or its
+  // negation does (false).
+  static std::optional<bool> dominatingVerify(scf::IfOp ifOp,
+                                              Operation *anchor) {
+    auto aborts = [](Region &region) {
+      return region
+          .walk([](LLVM::UnreachableOp) { return WalkResult::interrupt(); })
+          .wasInterrupted();
+    };
+    bool thenAborts = aborts(ifOp.getThenRegion());
+    bool elseAborts =
+        !ifOp.getElseRegion().empty() && aborts(ifOp.getElseRegion());
+    if (thenAborts == elseAborts)
       return std::nullopt;
-    arith::CmpIPredicate pred =
-        onLhs ? cmp.getPredicate() : swapPredicate(cmp.getPredicate());
+    Operation *a = anchor;
+    while (a && a->getBlock() != ifOp->getBlock())
+      a = a->getParentOp();
+    if (!a || a == ifOp || !ifOp->isBeforeInBlock(a))
+      return std::nullopt;
+    return elseAborts;
+  }
+
+  // The bound the relation `v REL other` puts on v when it holds, or when
+  // its negation holds. A constant `other` bounds through any predicate; a
+  // derived upper bound of `other` only through the signed ones, since an
+  // unsigned relation reads a negative `other` as huge.
+  static std::optional<int64_t> relationBound(arith::CmpIOp cmp, Value v,
+                                              bool holds, Operation *anchor,
+                                              unsigned depth) {
+    Value other;
+    arith::CmpIPredicate pred = cmp.getPredicate();
+    if (cmp.getLhs() == v || sameMemberLoad(cmp.getLhs(), v)) {
+      other = cmp.getRhs();
+    } else if (cmp.getRhs() == v || sameMemberLoad(cmp.getRhs(), v)) {
+      other = cmp.getLhs();
+      pred = swapPredicate(pred);
+    } else {
+      return std::nullopt;
+    }
     if (!holds)
       pred = arith::invertPredicate(pred);
-    int64_t c = cst.getSExtValue();
+    APInt cst;
+    bool constant = matchPattern(other, m_ConstantInt(&cst));
+    std::optional<int64_t> c =
+        constant ? std::optional<int64_t>(cst.getSExtValue())
+                 : derivedExtentBound(other, depth + 1, anchor);
+    if (!c)
+      return std::nullopt;
     switch (pred) {
+    case arith::CmpIPredicate::ule:
+      if (!constant)
+        return std::nullopt;
+      [[fallthrough]];
     case arith::CmpIPredicate::eq:
     case arith::CmpIPredicate::sle:
-    case arith::CmpIPredicate::ule:
-      return c;
-    case arith::CmpIPredicate::slt:
+      return *c;
     case arith::CmpIPredicate::ult:
-      return c - 1;
+      if (!constant)
+        return std::nullopt;
+      [[fallthrough]];
+    case arith::CmpIPredicate::slt:
+      return *c - 1;
     default:
       return std::nullopt;
     }
@@ -5419,38 +5478,36 @@ struct AffineToStableHLORaisingPass
   // Upper bound on `v` from the guards dominating `anchor`: a verify
   // `if (v REL C) <noreturn>` leaves the complementary relation holding on
   // every path that reaches the anchor, and inside the surviving branch of an
-  // enclosing `if (v REL C)` the relation holds.
-  static std::optional<int64_t> guardBound(Value v, Operation *anchor) {
+  // enclosing `if (v REL C)` the relation holds. The verify may compare an
+  // earlier load of the same member rather than this value.
+  static std::optional<int64_t> guardBound(Value v, Operation *anchor,
+                                           unsigned depth) {
     if (!anchor)
       return std::nullopt;
     std::optional<int64_t> bound;
-    auto aborts = [](Region &region) {
-      return region
-          .walk([](LLVM::UnreachableOp) { return WalkResult::interrupt(); })
-          .wasInterrupted();
-    };
-    for (Operation *user : v.getUsers()) {
-      auto cmp = dyn_cast<arith::CmpIOp>(user);
-      if (!cmp)
-        continue;
+    SmallVector<arith::CmpIOp> cmps;
+    for (Operation *user : v.getUsers())
+      if (auto cmp = dyn_cast<arith::CmpIOp>(user))
+        cmps.push_back(cmp);
+    if (v.getDefiningOp<affine::AffineLoadOp>())
+      if (auto fn = anchor->getParentOfType<FunctionOpInterface>())
+        fn->walk([&](arith::CmpIOp cmp) {
+          if (cmp.getLhs() != v && cmp.getRhs() != v &&
+              (sameMemberLoad(cmp.getLhs(), v) ||
+               sameMemberLoad(cmp.getRhs(), v)))
+            cmps.push_back(cmp);
+        });
+    for (arith::CmpIOp cmp : cmps)
       for (Operation *condUser : cmp->getUsers()) {
         auto ifOp = dyn_cast<scf::IfOp>(condUser);
         if (!ifOp || ifOp.getCondition() != cmp.getResult())
           continue;
-        bool thenAborts = aborts(ifOp.getThenRegion());
-        bool elseAborts =
-            !ifOp.getElseRegion().empty() && aborts(ifOp.getElseRegion());
-        if (thenAborts == elseAborts)
+        auto holds = dominatingVerify(ifOp, anchor);
+        if (!holds)
           continue;
-        Operation *a = anchor;
-        while (a && a->getBlock() != ifOp->getBlock())
-          a = a->getParentOp();
-        if (!a || a == ifOp || !ifOp->isBeforeInBlock(a))
-          continue;
-        if (auto b = relationBound(cmp, v, /*holds=*/elseAborts))
+        if (auto b = relationBound(cmp, v, *holds, anchor, depth))
           bound = std::min(bound.value_or(*b), *b);
       }
-    }
     for (Operation *cur = anchor; cur->getParentOp();
          cur = cur->getParentOp()) {
       auto ifOp = dyn_cast<scf::IfOp>(cur->getParentOp());
@@ -5460,8 +5517,87 @@ struct AffineToStableHLORaisingPass
       if (!cmp)
         continue;
       bool inThen = cur->getParentRegion() == &ifOp.getThenRegion();
-      if (auto b = relationBound(cmp, v, /*holds=*/inThen))
+      if (auto b = relationBound(cmp, v, inThen, anchor, depth))
         bound = std::min(bound.value_or(*b), *b);
+    }
+    return bound;
+  }
+
+  // The host value a staged scalar cell (gpu.alloc + memcpy from a stored
+  // alloca) was filled from.
+  static Value stagedHostValue(Value v) {
+    auto ld = v.getDefiningOp<affine::AffineLoadOp>();
+    if (!ld || !ld.getMapOperands().empty() ||
+        ld.getMemRefType().getNumElements() != 1)
+      return nullptr;
+    Value buf = ld.getMemRef();
+    if (!isa_and_nonnull<gpu::AllocOp>(buf.getDefiningOp()))
+      return nullptr;
+    Value src;
+    for (Operation *u : buf.getUsers())
+      if (auto mc = dyn_cast<enzymexla::MemcpyOp>(u);
+          mc && mc->getOperand(0) == buf) {
+        if (src)
+          return nullptr;
+        src = mc->getOperand(1);
+      }
+    if (!src)
+      return nullptr;
+    Value stored;
+    for (Operation *u : src.getUsers())
+      if (auto st = dyn_cast<affine::AffineStoreOp>(u);
+          st && st.getMemRef() == src) {
+        if (stored)
+          return nullptr;
+        stored = st.getValueToStore();
+      }
+    return stored;
+  }
+
+  // A load from a write-once singleton (MFEM's DeviceDofQuadLimits: a
+  // guarded init stores branch-selected constants, then invariant.start
+  // pins the memory) is bounded by the largest stored constant.
+  static std::optional<int64_t> writeOnceSingletonBound(Value v) {
+    Value memref;
+    std::optional<int64_t> idx;
+    if (auto ld = v.getDefiningOp<affine::AffineLoadOp>()) {
+      memref = ld.getMemRef();
+      if (ld.getMap().isSingleConstant())
+        idx = ld.getMap().getSingleConstantResult();
+    } else if (auto ld = v.getDefiningOp<memref::LoadOp>()) {
+      memref = ld.getMemRef();
+      APInt c;
+      if (ld.getIndices().size() == 1 &&
+          matchPattern(ld.getIndices()[0], m_ConstantInt(&c)))
+        idx = c.getSExtValue();
+    }
+    if (!idx)
+      return std::nullopt;
+    auto view = memref.getDefiningOp<enzymexla::Pointer2MemrefOp>();
+    if (!view)
+      return std::nullopt;
+    Value root = view->getOperand(0);
+    if (llvm::none_of(root.getUsers(), [](Operation *u) {
+          return isa<LLVM::InvariantStartOp>(u);
+        }))
+      return std::nullopt;
+    std::optional<int64_t> bound;
+    for (Operation *u : root.getUsers()) {
+      auto other = dyn_cast<enzymexla::Pointer2MemrefOp>(u);
+      if (!other)
+        continue;
+      for (Operation *vu : other->getUsers()) {
+        auto st = dyn_cast<affine::AffineStoreOp>(vu);
+        if (!st || st.getMemRef() != other.getResult())
+          continue;
+        APInt c;
+        if (!st.getMap().isSingleConstant() ||
+            !matchPattern(st.getValueToStore(), m_ConstantInt(&c)))
+          return std::nullopt;
+        if (st.getMap().getSingleConstantResult() != *idx)
+          continue;
+        bound = std::max(bound.value_or(c.getSExtValue()), c.getSExtValue());
+      }
     }
     return bound;
   }
@@ -5512,6 +5648,15 @@ struct AffineToStableHLORaisingPass
     if (isa_and_nonnull<arith::ExtUIOp, arith::ExtSIOp>(def))
       return operandBound(0);
     APInt k;
+    if (auto sh = dyn_cast_or_null<arith::ShLIOp>(def)) {
+      if (matchPattern(sh.getRhs(), m_ConstantInt(&k)) &&
+          k.getZExtValue() < 63) {
+        auto b = operandBound(0);
+        if (b && *b >= 0 && *b <= (INT64_MAX >> k.getZExtValue()))
+          return *b << k.getZExtValue();
+      }
+      return std::nullopt;
+    }
     if (auto t = dyn_cast_or_null<arith::TruncIOp>(def)) {
       // dim3 packing replicates a 32-bit dim into both halves of an i64 as
       // x * 0x100000001; either half recovers the dim.
@@ -5528,6 +5673,14 @@ struct AffineToStableHLORaisingPass
     if (auto sh = dyn_cast_or_null<arith::ShRUIOp>(def)) {
       if (matchPattern(sh.getRhs(), m_ConstantInt(&k)) &&
           k.getZExtValue() < 63) {
+        // The high half of the dim3 packing shifts the dim back out.
+        if (auto mul = sh.getLhs().getDefiningOp<arith::MulIOp>();
+            mul && k.getZExtValue() == 32) {
+          APInt m;
+          if (matchPattern(mul.getRhs(), m_ConstantInt(&m)) &&
+              m.getZExtValue() == 0x100000001ULL)
+            return derivedExtentBound(mul.getLhs(), depth + 1, anchor);
+        }
         auto b = operandBound(0);
         if (b && *b >= 0)
           return *b >> k.getZExtValue();
@@ -5567,7 +5720,9 @@ struct AffineToStableHLORaisingPass
       return isa<arith::AddIOp>(def) ? *b + k.getSExtValue()
                                      : *b - k.getSExtValue();
     }
-    return guardBound(v, anchor);
+    if (auto b = writeOnceSingletonBound(v))
+      return b;
+    return guardBound(v, anchor, depth);
   }
 
   // Bound on a parallel axis implied by the static scratch buffers its iv
@@ -5615,6 +5770,204 @@ struct AffineToStableHLORaisingPass
     return bound;
   }
 
+  // Upper bound of a single affine expression, evaluated over the bounds of
+  // its operands. Follows the launch-extent convention of derivedExtentBound:
+  // operand values are taken non-negative.
+  static std::optional<int64_t> affineExprExtentBound(AffineExpr e,
+                                                      AffineMap map,
+                                                      ValueRange ops,
+                                                      Operation *anchor) {
+    if (auto c = dyn_cast<AffineConstantExpr>(e))
+      return c.getValue();
+    if (auto d = dyn_cast<AffineDimExpr>(e))
+      return derivedExtentBound(ops[d.getPosition()], 0, anchor);
+    if (auto s = dyn_cast<AffineSymbolExpr>(e))
+      return derivedExtentBound(ops[map.getNumDims() + s.getPosition()], 0,
+                                anchor);
+    auto bin = dyn_cast<AffineBinaryOpExpr>(e);
+    if (!bin)
+      return std::nullopt;
+    auto l = affineExprExtentBound(bin.getLHS(), map, ops, anchor);
+    // Affine keeps the constant on the right.
+    auto rc = dyn_cast<AffineConstantExpr>(bin.getRHS());
+    switch (e.getKind()) {
+    case AffineExprKind::Add: {
+      auto r = affineExprExtentBound(bin.getRHS(), map, ops, anchor);
+      if (l && r)
+        return *l + *r;
+      return std::nullopt;
+    }
+    case AffineExprKind::Mul:
+      if (rc && l && *l >= 0 && rc.getValue() >= 0 &&
+          (rc.getValue() == 0 || *l <= INT64_MAX / rc.getValue()))
+        return *l * rc.getValue();
+      return std::nullopt;
+    case AffineExprKind::FloorDiv:
+      if (rc && rc.getValue() > 0 && l && *l >= 0)
+        return *l / rc.getValue();
+      return std::nullopt;
+    case AffineExprKind::CeilDiv:
+      if (rc && rc.getValue() > 0 && l && *l >= 0)
+        return (*l + rc.getValue() - 1) / rc.getValue();
+      return std::nullopt;
+    case AffineExprKind::Mod:
+      if (rc && rc.getValue() > 0)
+        return rc.getValue() - 1;
+      return std::nullopt;
+    default:
+      return std::nullopt;
+    }
+  }
+
+  // Strip the casts and dim3 packing (x replicated into both i64 halves as
+  // x * 0x100000001, or x | (y << 32)) off a launch-dimension value.
+  static Value stripLaunchDimPacking(Value v) {
+    auto shiftedBy32 = [](Value s) -> Value {
+      auto sl = s.getDefiningOp<arith::ShLIOp>();
+      APInt c;
+      if (sl && matchPattern(sl.getRhs(), m_ConstantInt(&c)) &&
+          c.getZExtValue() == 32)
+        return sl.getLhs();
+      return nullptr;
+    };
+    while (true) {
+      if (isa_and_nonnull<arith::IndexCastOp, arith::IndexCastUIOp,
+                          arith::ExtUIOp, arith::ExtSIOp>(v.getDefiningOp())) {
+        v = v.getDefiningOp()->getOperand(0);
+        continue;
+      }
+      APInt k;
+      if (auto t = v.getDefiningOp<arith::TruncIOp>()) {
+        // The low half of a disjoint-or pack is the un-shifted side.
+        if (auto orv = t.getIn().getDefiningOp<arith::OrIOp>()) {
+          if (shiftedBy32(orv.getRhs())) {
+            v = orv.getLhs();
+            continue;
+          }
+          if (shiftedBy32(orv.getLhs())) {
+            v = orv.getRhs();
+            continue;
+          }
+        }
+        v = t.getIn();
+        continue;
+      }
+      if (auto sh = v.getDefiningOp<arith::ShRUIOp>();
+          sh && matchPattern(sh.getRhs(), m_ConstantInt(&k)) &&
+          k.getZExtValue() == 32) {
+        // The high half of a disjoint-or pack shifts back out of the
+        // shifted side.
+        if (auto orv = sh.getLhs().getDefiningOp<arith::OrIOp>()) {
+          if (Value high = shiftedBy32(orv.getRhs())) {
+            v = high;
+            continue;
+          }
+          if (Value high = shiftedBy32(orv.getLhs())) {
+            v = high;
+            continue;
+          }
+        }
+        v = sh.getLhs();
+        continue;
+      }
+      if (auto mul = v.getDefiningOp<arith::MulIOp>();
+          mul && matchPattern(mul.getRhs(), m_ConstantInt(&k)) &&
+          k.getZExtValue() == 0x100000001ULL) {
+        v = mul.getLhs();
+        continue;
+      }
+      return v;
+    }
+  }
+
+  // Two values a dominating noreturn verify pins equal (MFEM_VERIFY(q == d))
+  // share their launch-budget dimension.
+  static bool guardEqual(Value a, Value b, Operation *anchor) {
+    if (a == b || sameMemberLoad(a, b))
+      return true;
+    auto fn = anchor->getParentOfType<FunctionOpInterface>();
+    if (!fn)
+      return false;
+    bool eq = false;
+    fn->walk([&](arith::CmpIOp cmp) {
+      if (eq)
+        return;
+      bool lhsA = cmp.getLhs() == a || sameMemberLoad(cmp.getLhs(), a);
+      bool rhsB = cmp.getRhs() == b || sameMemberLoad(cmp.getRhs(), b);
+      bool lhsB = cmp.getLhs() == b || sameMemberLoad(cmp.getLhs(), b);
+      bool rhsA = cmp.getRhs() == a || sameMemberLoad(cmp.getRhs(), a);
+      if (!((lhsA && rhsB) || (lhsB && rhsA)))
+        return;
+      for (Operation *condUser : cmp->getUsers()) {
+        auto ifOp = dyn_cast<scf::IfOp>(condUser);
+        if (!ifOp || ifOp.getCondition() != cmp.getResult())
+          continue;
+        auto holds = dominatingVerify(ifOp, anchor);
+        if (!holds)
+          continue;
+        auto pred = *holds ? cmp.getPredicate()
+                           : arith::invertPredicate(cmp.getPredicate());
+        if (pred == arith::CmpIPredicate::eq)
+          eq = true;
+      }
+    });
+    return eq;
+  }
+
+  // A CUDA launch whose block exceeds 1024 threads fails, so the reference
+  // execution only ever runs block extents within the hardware budget.
+  // When this extent is one of the launch's block dimensions, split the
+  // budget over the dimensions sharing its value; other constant block
+  // dims consume their share, and unmatched dynamic ones count as >= 1.
+  static std::optional<int64_t> launchDimBound(Value ext,
+                                               enzymexla::GPUWrapperOp g) {
+    auto rootOf = [](Value v) {
+      v = stripLaunchDimPacking(v);
+      if (Value host = stagedHostValue(v))
+        v = stripLaunchDimPacking(host);
+      return v;
+    };
+    Value root = rootOf(ext);
+    if (g->getNumOperands() < 6)
+      return std::nullopt;
+    int64_t budget = 1024;
+    unsigned sharing = 0;
+    for (unsigned i = 3; i < 6; ++i) {
+      Value bd = g->getOperand(i);
+      APInt c;
+      if (matchPattern(bd, m_ConstantInt(&c))) {
+        budget /= std::max<int64_t>(1, c.getSExtValue());
+        continue;
+      }
+      Value r = rootOf(bd);
+      if (r == root || sameMemberLoad(r, root) || guardEqual(r, root, g))
+        ++sharing;
+    }
+    if (!sharing || budget <= 0)
+      return std::nullopt;
+    // The largest b with b^sharing <= budget.
+    int64_t b = budget;
+    if (sharing == 2)
+      b = (int64_t)std::sqrt((double)budget);
+    else if (sharing == 3)
+      b = (int64_t)std::cbrt((double)budget);
+    while (b > 1) {
+      int64_t prod = 1;
+      bool over = false;
+      for (unsigned i = 0; i < sharing; ++i) {
+        if (prod > budget / b) {
+          over = true;
+          break;
+        }
+        prod *= b;
+      }
+      if (!over && prod <= budget)
+        break;
+      --b;
+    }
+    return b;
+  }
+
   // A parallel axis whose extent is dynamic but provably bounded (a block
   // size clamped by a min against a constant, capped by a guard, or indexing
   // a static scratch buffer) batches
@@ -5645,18 +5998,33 @@ struct AffineToStableHLORaisingPass
         if (um.getNumResults() != 1)
           continue;
         Value ext;
-        if (auto sym = dyn_cast<AffineSymbolExpr>(um.getResult(0)))
+        std::optional<int64_t> bound;
+        if (auto sym = dyn_cast<AffineSymbolExpr>(um.getResult(0))) {
           ext =
               par.getUpperBoundsOperands()[um.getNumDims() + sym.getPosition()];
-        else if (auto dim = dyn_cast<AffineDimExpr>(um.getResult(0)))
+        } else if (auto dim = dyn_cast<AffineDimExpr>(um.getResult(0))) {
           ext = par.getUpperBoundsOperands()[dim.getPosition()];
-        else
-          continue;
-        if (auto c = derivedExtentBound(ext, 0, par))
-          bounded.push_back({i, *c, ext});
-        else if (auto ab = allocaIndexBound(par.getOperation(), par.getBody(),
-                                            par.getBody()->getArgument(i)))
-          bounded.push_back({i, *ab, ext});
+        } else {
+          // A composite bound (s0 * 3 and the like): bound the expression
+          // and materialize the extent for the guard.
+          bound = affineExprExtentBound(um.getResult(0), um,
+                                        par.getUpperBoundsOperands(), par);
+          if (!bound)
+            continue;
+          OpBuilder pre(par);
+          ext = affine::AffineApplyOp::create(pre, par.getLoc(), um,
+                                              par.getUpperBoundsOperands());
+        }
+        if (!bound)
+          bound = derivedExtentBound(ext, 0, par);
+        if (!bound)
+          bound = allocaIndexBound(par.getOperation(), par.getBody(),
+                                   par.getBody()->getArgument(i));
+        if (auto g = par->getParentOfType<enzymexla::GPUWrapperOp>())
+          if (auto launch = launchDimBound(ext, g))
+            bound = std::min(bound.value_or(*launch), *launch);
+        if (bound)
+          bounded.push_back({i, *bound, ext});
       }
       if (bounded.empty())
         continue;
