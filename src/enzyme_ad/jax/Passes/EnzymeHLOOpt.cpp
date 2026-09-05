@@ -3118,6 +3118,15 @@ struct SliceBroadcast final
     if (innerSlice && !llvm::hasSingleElement(bcast->getUsers()))
       return failure();
 
+    // The new broadcast must be dimensionally consistent: every mapped
+    // operand dim must equal its result dim or be 1.
+    for (auto [i, outdim] : llvm::enumerate(bcast.getBroadcastDimensions())) {
+      int64_t od = (in_end[i] - in_start[i] + in_stride[i] - 1) / in_stride[i];
+      int64_t rd = op.getType().getShape()[outdim];
+      if (od != rd && od != 1)
+        return failure();
+    }
+
     Value tobcast = bcast.getOperand();
     if (innerSlice)
       tobcast = stablehlo::SliceOp::create(rewriter, op.getLoc(), tobcast,
@@ -35652,7 +35661,11 @@ struct ScatterMaskedIndexSimplify final
     auto idxTy = cast<RankedTensorType>(indices.getType());
     if (idxTy.getNumElements() != 1)
       return failure();
-    auto sel = indices.getDefiningOp<stablehlo::SelectOp>();
+    // The select may sit behind reshapes of the single-element index.
+    Value idxSrc = indices;
+    while (auto rs = idxSrc.getDefiningOp<stablehlo::ReshapeOp>())
+      idxSrc = rs.getOperand();
+    auto sel = idxSrc.getDefiningOp<stablehlo::SelectOp>();
     if (!sel)
       return failure();
     SplatElementsAttr offSplat;
