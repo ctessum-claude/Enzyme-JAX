@@ -15,6 +15,7 @@ namespace mlir::comm {
 } // namespace mlir::comm
 
 using namespace mlir;
+using ::enzymexla::LookupSymbol;
 
 struct LowerCommMpiConstantOpToStablehlo
     : public OpConversionPattern<comm::MpiConstantOp> {
@@ -40,7 +41,7 @@ struct LowerCommMpiConstantOpToStablehlo
           op, "MPI constant is not a valid attribute");
     }
 
-    auto value = enzymexla::LookupSymbol(name.data());
+    auto value = LookupSymbol(name.data());
     if (!value)
       return rewriter.notifyMatchFailure(op, "MPI constant `" + name +
                                                  "` not found");
