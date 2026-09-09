@@ -112,11 +112,11 @@ partially overlaps a producer-side change we already landed (394 -> 331 copies,
 
 ## Tested vs. written
 
-Plainly: **I wrote both lit tests and ran neither.** There is no bazel and no
-clang on the machine this was developed on, and building
-`enzymexlamlir-opt` means a bazel build of XLA — hours to days and tens of GB,
-which I did not attempt. I looked for a cheaper harness (a prebuilt opt binary
-in the Julia artifact tree, a system MLIR) and there is none.
+Plainly: **I wrote both lit tests and ran neither.** There is no bazel on the
+machine this was developed on, and building `enzymexlamlir-opt` means a bazel
+build of XLA — hours to days and tens of GB, which I did not attempt. I looked
+for a cheaper harness (a prebuilt opt binary in the Julia artifact tree, a
+system MLIR) and there is none.
 
 What I did do:
 
@@ -135,6 +135,14 @@ What I did do:
   "88 of 91 drop to one reader" numbers were obtained. That validates the
   *semantics* of the predicate against real input; it does not validate the
   C++.
+* **Syntax- and warning-checked the new helper** by extracting it verbatim into
+  a standalone translation unit against hand-written stubs shaped like the MLIR
+  and LLVM APIs it uses, and compiling with `g++ -fsyntax-only -std=c++17
+  -Wall`: clean, no warnings. That catches typos and type misuse in the helper;
+  it does not prove the real headers agree.
+* Ran `clang-format` (23.1.0, from PyPI — possibly newer than the project's CI
+  version) over the touched files and kept only the reformatting of the new
+  code.
 * Wrote two lit tests in the project's conventions, each pinned to the single
   pattern under test so they cannot pass by accident via a const-folder:
   * `test/lit_tests/sliceofdynamicupdate_arithindex.mlir` — disjoint via

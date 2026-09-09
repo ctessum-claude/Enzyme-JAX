@@ -1712,8 +1712,7 @@ static bool fitsInIntType(int64_t v, unsigned width, bool isUnsigned) {
 
 } // namespace
 
-bool matchConstantIntScalar(mlir::Value v, int64_t &result,
-                            unsigned maxDepth) {
+bool matchConstantIntScalar(mlir::Value v, int64_t &result, unsigned maxDepth) {
   auto ty = dyn_cast<RankedTensorType>(v.getType());
   if (!ty || !ty.hasStaticShape() || ty.getNumElements() != 1)
     return false;
@@ -1769,20 +1768,21 @@ bool matchConstantIntScalar(mlir::Value v, int64_t &result,
   // both for int64 overflow and for representability in the op's own element
   // type, so the folded value is exactly what the op computes -- no reliance on
   // wraparound behaviour.
-  auto foldBinop = [&](Value lhsV, Value rhsV,
-                       llvm::function_ref<bool(int64_t, int64_t, int64_t &)> f) {
-    int64_t lhs, rhs, out;
-    if (!matchConstantIntScalar(lhsV, lhs, maxDepth - 1))
-      return false;
-    if (!matchConstantIntScalar(rhsV, rhs, maxDepth - 1))
-      return false;
-    if (!f(lhs, rhs, out))
-      return false;
-    if (!fitsInIntType(out, elemTy.getWidth(), isUnsigned))
-      return false;
-    result = out;
-    return true;
-  };
+  auto foldBinop =
+      [&](Value lhsV, Value rhsV,
+          llvm::function_ref<bool(int64_t, int64_t, int64_t &)> f) {
+        int64_t lhs, rhs, out;
+        if (!matchConstantIntScalar(lhsV, lhs, maxDepth - 1))
+          return false;
+        if (!matchConstantIntScalar(rhsV, rhs, maxDepth - 1))
+          return false;
+        if (!f(lhs, rhs, out))
+          return false;
+        if (!fitsInIntType(out, elemTy.getWidth(), isUnsigned))
+          return false;
+        result = out;
+        return true;
+      };
 
   if (auto add = dyn_cast<stablehlo::AddOp>(def))
     return foldBinop(add.getLhs(), add.getRhs(),
