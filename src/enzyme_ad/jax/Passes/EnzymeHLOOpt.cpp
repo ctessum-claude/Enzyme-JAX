@@ -655,11 +655,10 @@ struct DynamicSliceToStatic final
          llvm::zip(op.getStartIndices(), op.getSliceSizes(),
                    op.getOperand().getType().getShape())) {
 
-      DenseIntElementsAttr startattr;
-      if (!matchPattern(start, m_Constant(&startattr))) {
+      int64_t startv;
+      if (!matchConstantIntScalar(start, startv)) {
         return failure();
       }
-      int64_t startv = (*startattr.begin()).getSExtValue();
       if (startv < 0)
         return failure();
       if (startv + size > shape)
@@ -2615,6 +2614,11 @@ struct DynamicUpdateToConcat final
   }
 };
 
+// Forward a static read past a dynamic_update_slice with a compile-time-known
+// window: read the update when the read window is contained in it, read the
+// operand when the two are provably disjoint.  The start index is matched
+// semantically (see matchConstantIntScalar), not syntactically, because
+// producers routinely spell it as arithmetic over constants.
 struct SliceOfDynamicUpdate final
     : CheckedOpRewritePattern<stablehlo::SliceOp, SliceOfDynamicUpdate> {
   using CheckedOpRewritePattern::CheckedOpRewritePattern;
@@ -2639,12 +2643,11 @@ struct SliceOfDynamicUpdate final
       for (auto &&[nstart, nend, nstep, update_start, update_size] : llvm::zip(
                op.getStartIndices(), op.getLimitIndices(), op.getStrides(),
                dyn.getStartIndices(), dyn.getUpdate().getType().getShape())) {
-        DenseIntElementsAttr startattr;
-        if (!matchPattern(update_start, m_Constant(&startattr))) {
+        int64_t startv;
+        if (!matchConstantIntScalar(update_start, startv)) {
           legal = false;
           break;
         }
-        int64_t startv = (*startattr.begin()).getSExtValue();
         if (startv < 0) {
           legal = false;
           break;
@@ -2683,12 +2686,11 @@ struct SliceOfDynamicUpdate final
       for (auto &&[nstart, nend, nstep, update_start, update_size] : llvm::zip(
                op.getStartIndices(), op.getLimitIndices(), op.getStrides(),
                dyn.getStartIndices(), dyn.getUpdate().getType().getShape())) {
-        DenseIntElementsAttr startattr;
-        if (!matchPattern(update_start, m_Constant(&startattr))) {
+        int64_t startv;
+        if (!matchConstantIntScalar(update_start, startv)) {
           continue;
         }
 
-        int64_t startv = (*startattr.begin()).getSExtValue();
         // slice ends below insertion
         if (nend <= startv) {
           no_overlap = true;

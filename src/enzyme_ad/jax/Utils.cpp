@@ -1699,6 +1699,110 @@ detectIotaLikeTensorImpl(DenseElementsAttr denseAttr) {
 
 } // namespace
 
+namespace {
+
+// Is `v` exactly representable in an `width`-bit integer of the given
+// signedness?
+static bool fitsInIntType(int64_t v, unsigned width, bool isUnsigned) {
+  if (width >= 64)
+    return isUnsigned ? v >= 0 : true;
+  return isUnsigned ? (v >= 0 && llvm::isUIntN(width, (uint64_t)v))
+                    : llvm::isIntN(width, v);
+}
+
+} // namespace
+
+bool matchConstantIntScalar(mlir::Value v, int64_t &result,
+                            unsigned maxDepth) {
+  auto ty = dyn_cast<RankedTensorType>(v.getType());
+  if (!ty || !ty.hasStaticShape() || ty.getNumElements() != 1)
+    return false;
+  auto elemTy = dyn_cast<IntegerType>(ty.getElementType());
+  if (!elemTy)
+    return false;
+  bool isUnsigned = elemTy.isUnsigned();
+
+  // A literal constant (and anything else m_Constant sees through).
+  DenseIntElementsAttr attr;
+  if (matchPattern(v, m_Constant(&attr))) {
+    if (attr.getNumElements() != 1)
+      return false;
+    llvm::APInt ap = *attr.begin();
+    if (isUnsigned) {
+      if (ap.getActiveBits() > 63)
+        return false;
+      result = (int64_t)ap.getZExtValue();
+    } else {
+      if (ap.getSignificantBits() > 64)
+        return false;
+      result = ap.getSExtValue();
+    }
+    return true;
+  }
+
+  if (maxDepth == 0)
+    return false;
+
+  Operation *def = v.getDefiningOp();
+  if (!def)
+    return false;
+
+  // Shape-only reshuffle of a single element.
+  if (auto reshape = dyn_cast<stablehlo::ReshapeOp>(def))
+    return matchConstantIntScalar(reshape.getOperand(), result, maxDepth - 1);
+
+  // A widening integer-to-integer convert of the same signedness preserves the
+  // value exactly.
+  if (auto convert = dyn_cast<stablehlo::ConvertOp>(def)) {
+    auto inTy = dyn_cast<RankedTensorType>(convert.getOperand().getType());
+    if (!inTy)
+      return false;
+    auto inElemTy = dyn_cast<IntegerType>(inTy.getElementType());
+    if (!inElemTy || inElemTy.getSignedness() != elemTy.getSignedness())
+      return false;
+    if (inElemTy.getWidth() > elemTy.getWidth())
+      return false;
+    return matchConstantIntScalar(convert.getOperand(), result, maxDepth - 1);
+  }
+
+  // Integer arithmetic over compile-time-known scalars.  Every fold is checked
+  // both for int64 overflow and for representability in the op's own element
+  // type, so the folded value is exactly what the op computes -- no reliance on
+  // wraparound behaviour.
+  auto foldBinop = [&](Value lhsV, Value rhsV,
+                       llvm::function_ref<bool(int64_t, int64_t, int64_t &)> f) {
+    int64_t lhs, rhs, out;
+    if (!matchConstantIntScalar(lhsV, lhs, maxDepth - 1))
+      return false;
+    if (!matchConstantIntScalar(rhsV, rhs, maxDepth - 1))
+      return false;
+    if (!f(lhs, rhs, out))
+      return false;
+    if (!fitsInIntType(out, elemTy.getWidth(), isUnsigned))
+      return false;
+    result = out;
+    return true;
+  };
+
+  if (auto add = dyn_cast<stablehlo::AddOp>(def))
+    return foldBinop(add.getLhs(), add.getRhs(),
+                     [](int64_t a, int64_t b, int64_t &out) {
+                       return !llvm::AddOverflow(a, b, out);
+                     });
+  if (auto sub = dyn_cast<stablehlo::SubtractOp>(def))
+    return foldBinop(sub.getLhs(), sub.getRhs(),
+                     [](int64_t a, int64_t b, int64_t &out) {
+                       return !llvm::SubOverflow(a, b, out);
+                     });
+  if (auto mul = dyn_cast<stablehlo::MulOp>(def))
+    return foldBinop(mul.getLhs(), mul.getRhs(),
+                     [](int64_t a, int64_t b, int64_t &out) {
+                       return !llvm::MulOverflow(a, b, out);
+                     });
+
+  return false;
+}
+
 bool isZero(mlir::ElementsAttr v) {
   if (auto iface =
           llvm::dyn_cast<mlir::enzyme::AutoDiffTypeInterface>(v.getType())) {

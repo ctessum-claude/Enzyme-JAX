@@ -1211,6 +1211,25 @@ std::optional<PaddedTensor> detectPaddedTensor(mlir::DenseElementsAttr attr);
 bool isZero(mlir::ElementsAttr v);
 bool isZero(mlir::Value v);
 
+/// Match `v` as a compile-time-known scalar integer, looking through integer
+/// arithmetic (and shape-only casts) whose operands are themselves
+/// compile-time known.  On success `result` holds the value.
+///
+/// This exists because `matchPattern(v, m_Constant(...))` is *syntactic*: it
+/// only succeeds on an actual `stablehlo.constant`.  Frontends routinely emit
+/// an index as a small arithmetic expression over constants -- Reactant, for
+/// instance, lowers a 1-based Julia index to
+/// `stablehlo.subtract %c_start, %c_one` -- which means every simplification
+/// that requires a constant `dynamic_update_slice` / `dynamic_slice` start
+/// index silently stops firing unless a separate integer constant-folding
+/// pattern happens to have run first.  Matching semantically instead of
+/// syntactically decouples those simplifications from the folder.
+///
+/// Only exactly-representable, non-overflowing integer arithmetic is folded;
+/// `maxDepth` bounds the recursion.
+bool matchConstantIntScalar(mlir::Value v, int64_t &result,
+                            unsigned maxDepth = 8);
+
 // Helper to check if a TypedAttr is zero
 inline bool isZeroAttr(mlir::TypedAttr attr) {
   if (auto intAttr = llvm::dyn_cast<mlir::IntegerAttr>(attr))
