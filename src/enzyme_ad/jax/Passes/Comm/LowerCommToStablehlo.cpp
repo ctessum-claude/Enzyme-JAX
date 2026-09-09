@@ -7,6 +7,7 @@
 #include "src/enzyme_ad/jax/Passes/Comm/Passes.h"
 #include "src/enzyme_ad/jax/Passes/Comm/TypeConversion.h"
 #include "src/enzyme_ad/jax/Runtime/jit/jit.h"
+#include "src/enzyme_ad/jax/Utils.h"
 #include "stablehlo/dialect/StablehloOps.h"
 
 namespace mlir::comm {
@@ -15,6 +16,7 @@ namespace mlir::comm {
 } // namespace mlir::comm
 
 using namespace mlir;
+using namespace mlir::enzyme;
 using ::enzymexla::LookupSymbol;
 
 struct LowerCommMpiConstantOpToStablehlo
@@ -32,9 +34,9 @@ struct LowerCommMpiConstantOpToStablehlo
 
     llvm::StringRef name;
     auto value_attr = op.getValue();
-    if (auto attr = cast<comm::MpiCommAttr>(value_attr)) {
+    if (auto attr = dyn_cast<comm::MpiCommAttr>(value_attr)) {
       name = comm::stringifyMpiCommEnum(attr.getValue());
-    } else if (auto attr = cast<comm::MpiOpAttr>(value_attr)) {
+    } else if (auto attr = dyn_cast<comm::MpiOpAttr>(value_attr)) {
       name = comm::stringifyMpiOpEnum(attr.getValue());
     } else {
       return rewriter.notifyMatchFailure(
@@ -42,16 +44,14 @@ struct LowerCommMpiConstantOpToStablehlo
     }
 
     auto value = LookupSymbol(name.data());
-    if (!value)
-      return rewriter.notifyMatchFailure(op, "MPI constant `" + name +
-                                                 "` not found");
-
-    auto constant_attr = SplatElementsAttr::get(
-        RankedTensorType::get({}, rewriter.getIntegerType(64)),
-        ArrayRef(APInt(64, reinterpret_cast<int64_t>(value.get()))));
+    if (auto err = value.takeError())
+      return rewriter.notifyMatchFailure(op, toString(std::move(err)));
 
     rewriter.replaceOpWithNewOp<stablehlo::ConstantOp>(
-        op, restype, cast<ElementsAttr>(constant_attr));
+        op, restype,
+        cast<ElementsAttr>(
+            makeAttr(RankedTensorType::get({}, rewriter.getIntegerType(64)),
+                     reinterpret_cast<int64_t>(value.get()))));
 
     return success();
   }
