@@ -16,7 +16,7 @@ namespace mlir::comm {
 
 using namespace mlir;
 
-struct LowerCommMpiConstantOp
+struct LowerCommMpiConstantOpToStablehlo
     : public OpConversionPattern<comm::MpiConstantOp> {
   using OpConversionPattern::OpConversionPattern;
 
